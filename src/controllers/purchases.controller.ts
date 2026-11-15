@@ -1,0 +1,234 @@
+import { reply, RejectedWrite } from "../utils/reply";
+import { Request, Response } from "express";
+import { v4 as uuidv4 } from "uuid";
+import { purchase } from "../types/purchase";
+import { atomic, ref, get, set, update, remove } from "../database";
+import { createOrUpdateProductInternal } from "./products.controller";
+import { database } from "../firebaseConfig";
+import { resolveOperationDate } from "../utils/operationDate";
+
+const normalizeId = (value: any) =>
+  typeof value === "string" ? value : value?.id || "";
+
+const linkPurchaseToSupplier = async (supplierId: string, purchaseId: string) => {
+  if (!supplierId || !purchaseId) return;
+
+  const supplierRef = ref(database, `supplier/${supplierId}`);
+  const supplierSnapshot = await get(supplierRef);
+  if (!supplierSnapshot.exists()) return;
+
+  const supplier = supplierSnapshot.val();
+  const purchases = Array.from(
+    new Set([...(supplier.purchases || []), purchaseId])
+  );
+
+  await update(supplierRef, {
+    purchases,
+    updatedDate: new Date().toLocaleString(),
+  });
+};
+
+// ✅ الحصول على جميع عمليات الشراء
+export const getAllPurchases = async (_req: Request, res: Response) => {
+  try {
+    const dbRef = ref(database, "purchases");
+    const snapshot = await get(dbRef);
+    const purchases = snapshot.exists() ? Object.values(snapshot.val()) : [];
+    res.json(purchases);
+  } catch (error: any) {
+    console.error("Error fetching purchases:", error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ✅ إنشاء عملية شراء جديدة (API)
+export const createPurchase = async (req: Request, res: Response) => {
+  try {
+    const result = await atomic(database, async () => {
+      const {
+        supplierId,
+        products,
+        totalPrice,
+        paymentStatus,
+        remainingDebt,
+        code,
+        warehouse,
+        quantity,
+        payPrice,
+        name,
+        currency,
+        exchangeRate,
+        amount_base,
+        transferCost,
+        date,
+      } = req.body;
+
+      const id = uuidv4();
+      const operationDate = resolveOperationDate(date);
+      const normalizedSupplierId = normalizeId(supplierId);
+
+      const purchaseData: purchase = {
+        id,
+        executer: res.locals.executer,
+        supplierId: normalizedSupplierId,
+        code,
+        warehouse,
+        quantity,
+        payPrice,
+        totalPrice,
+        paymentStatus,
+        remainingDebt,
+        date: operationDate,
+        name,
+        currency,
+        exchangeRate,
+        amount_base,
+        transferCost: Number(transferCost || 0),
+      };
+
+      // ✅ حفظ عملية الشراء في قاعدة البيانات
+      await set(ref(database, `purchases/${id}`), purchaseData);
+      await linkPurchaseToSupplier(normalizedSupplierId, id);
+
+      // ✅ تحديث المخزون لكل منتج تمت إضافته
+      if (Array.isArray(products)) {
+        for (const p of products) {
+          await createOrUpdateProductInternal(p);
+        }
+      }
+
+      return reply(200, { message: "✅ تم تسجيل عملية الشراء", data: purchaseData });
+    });
+    return res.status(result.status).json(result.body);
+  } catch (error: any) {
+    if (error instanceof RejectedWrite) return res.status(error.status).json(error.body);
+    console.error("Error creating purchase:", error);
+    const statusCode = error?.message === "Invalid operation date" ? 400 : 500;
+    res.status(statusCode).json({ error: error.message });
+  }
+};
+
+// ✅ إنشاء عملية شراء داخلية (بدون استجابة HTTP)
+export const createPurchaseInternal = async (
+  newPurchase: purchase
+): Promise<purchase> => {
+  const id = uuidv4();
+  const operationDate = resolveOperationDate(newPurchase.date);
+
+  const purchaseData: purchase = {
+    ...newPurchase,
+    transferCost: Number(newPurchase.transferCost || 0),
+    id,
+    date: operationDate,
+  };
+
+  await set(ref(database, `purchases/${id}`), purchaseData);
+  return purchaseData;
+};
+
+// ✅ حذف عملية شراء
+export const deletePurchase = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const dbRef = ref(database, `purchases/${id}`);
+    const snapshot = await get(dbRef);
+
+    if (!snapshot.exists()) {
+      return res.status(404).json({ message: "❌ عملية الشراء غير موجودة" });
+    }
+
+    await remove(dbRef);
+    res.json({ message: "✅ تم حذف عملية الشراء" });
+  } catch (error: any) {
+    console.error("Error deleting purchase:", error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ✅ حذف عملية شراء داخليًا
+export const deletePurchaseInternal = async (id: string): Promise<boolean> => {
+  const dbRef = ref(database, `purchases/${id}`);
+  const snapshot = await get(dbRef);
+  if (!snapshot.exists()) return false;
+
+  await remove(dbRef);
+  return true;
+};
+
+// ✅ جلب عملية شراء واحدة داخليًا
+export const getPurchaseByIdInternal = async (
+  id: string
+): Promise<purchase | null> => {
+  const dbRef = ref(database, `purchases/${id}`);
+  const snapshot = await get(dbRef);
+  return snapshot.exists() ? snapshot.val() : null;
+};
+
+// ✅ جلب جميع عمليات الشراء داخليًا
+export const getAllPurchasesInternal = async (): Promise<purchase[]> => {
+  const dbRef = ref(database, "purchases");
+  const snapshot = await get(dbRef);
+  return snapshot.exists() ? Object.values(snapshot.val()) : [];
+};
+// ✅ تعديل عملية شراء (API خارجي)
+export const updatePurchase = async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const updatedData: Partial<purchase> = req.body;
+
+    const dbRef = ref(database, `purchases/${id}`);
+    const snapshot = await get(dbRef);
+
+    if (!snapshot.exists()) {
+      return res.status(404).json({ message: "❌ عملية الشراء غير موجودة" });
+    }
+
+    const existingPurchase: purchase = snapshot.val();
+
+    // تحديث المخزون إذا تم تمرير منتجات جديدة
+    if (
+      "products" in updatedData &&
+      Array.isArray((updatedData as any).products)
+    ) {
+      for (const p of (updatedData as any).products) {
+        await createOrUpdateProductInternal(p);
+      }
+    }
+
+
+    const newPurchaseData: purchase = {
+      ...existingPurchase,
+      ...updatedData,
+      date: existingPurchase.date, // الحفاظ على تاريخ الإنشاء الأصلي
+    };
+
+    await set(dbRef, newPurchaseData);
+
+    res.json({ message: "✅ تم تعديل عملية الشراء", data: newPurchaseData });
+  } catch (error: any) {
+    console.error("Error updating purchase:", error);
+    res.status(500).json({ error: error.message });
+  }
+};
+
+// ✅ تعديل عملية شراء داخليًا (Internal)
+export const updatePurchaseInternal = async (
+  id: string,
+  updatedData: Partial<purchase>
+): Promise<purchase | null> => {
+  const dbRef = ref(database, `purchases/${id}`);
+  const snapshot = await get(dbRef);
+
+  if (!snapshot.exists()) return null;
+
+  const existingPurchase: purchase = snapshot.val();
+
+  const newPurchaseData: purchase = {
+    ...existingPurchase,
+    ...updatedData,
+    date: existingPurchase.date, // الحفاظ على تاريخ الإنشاء الأصلي
+  };
+
+  await set(dbRef, newPurchaseData);
+  return newPurchaseData;
+};
