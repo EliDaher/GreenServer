@@ -1,4 +1,4 @@
-import { get, ref } from "../database";
+import { get, ref } from "firebase/database";
 import { database } from "../firebaseConfig";
 
 export type OperationRow = {

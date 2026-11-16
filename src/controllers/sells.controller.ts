@@ -1,6 +1,7 @@
-import { reply, RejectedWrite } from "../utils/reply";
+import { decimal, roundNumber, normalizeNumbers, normalizeInvoice } from "../utils/numbers";
+import { set, update } from "../utils/database";
 import { Request, Response } from "express";
-import { atomic, ref, get, set, update, remove, push } from "../database";
+import { ref, get, remove } from "firebase/database";
 import { v4 as uuidv4 } from "uuid";
 import { sell } from "../types/sell";
 import { Payment } from "../types/payment";
@@ -32,6 +33,16 @@ export const createSell = async (req: Request, res: Response) => {
       date: operationDate,
     };
 
+    Object.assign(
+      newSell,
+      normalizeInvoice(
+        newSell,
+        newSell.products.reduce(
+          (sum, p) => sum.plus(decimal(roundNumber(p.sellPrice)).times(roundNumber(p.qty))),
+          decimal(0)
+        ).minus(roundNumber(newSell.discount || 0))
+      )
+    );
     await set(ref(database, `sells/${id}`), newSell);
 
     res.json({ message: "✅ تم تسجيل فاتورة البيع", data: newSell });
@@ -76,6 +87,16 @@ export const createSellInternal = async (newSell: sell): Promise<sell> => {
       date: operationDate,
     };
 
+    Object.assign(
+      sellData,
+      normalizeInvoice(
+        sellData,
+        sellData.products.reduce(
+          (sum, p) => sum.plus(decimal(roundNumber(p.sellPrice)).times(roundNumber(p.qty))),
+          decimal(0)
+        ).minus(roundNumber(sellData.discount || 0))
+      )
+    );
     await set(ref(database, `sells/${id}`), sellData);
     return sellData;
   } catch (error) {
@@ -112,157 +133,154 @@ export const getSellById = async (req: Request, res: Response) => {
 // 🧩 تحديث فاتورة بيع
 export const updateSellById = async (req: Request, res: Response) => {
   try {
-    const result = await atomic(database, async () => {
-      const { id } = req.params;
-      const updateData = req.body?.data;
+    const { id } = req.params;
+    const updateData = req.body?.data;
 
-      // ✅ Validation أساسي
-      if (!id) {
-        return reply(400, { message: "معرف الفاتورة غير صالح" });
-      }
+    // ✅ Validation أساسي
+    if (!id) {
+      return res.status(400).json({ message: "معرف الفاتورة غير صالح" });
+    }
 
-      if (!updateData || !Array.isArray(updateData.products)) {
-        return reply(400, { message: "بيانات التحديث غير صالحة" });
-      }
+    if (!updateData || !Array.isArray(updateData.products)) {
+      return res.status(400).json({ message: "بيانات التحديث غير صالحة" });
+    }
 
-      const sellRef = ref(database, `sells/${id}`);
-      const snapshot = await get(sellRef);
+    const sellRef = ref(database, `sells/${id}`);
+    const snapshot = await get(sellRef);
 
-      if (!snapshot.exists()) {
-        return reply(404, { message: "❌ فاتورة البيع غير موجودة" });
-      }
+    if (!snapshot.exists()) {
+      return res.status(404).json({ message: "❌ فاتورة البيع غير موجودة" });
+    }
 
-      const sellData = snapshot.val();
-      const oldTotalPrice = Number(sellData.totalPrice || 0);
+    const sellData = snapshot.val();
+    const oldTotalPrice = Number(sellData.totalPrice || 0);
 
-      // =========================
-      // 🧾 تعديل المخزون
-      // =========================
+    // =========================
+    // 🧾 تعديل المخزون
+    // =========================
 
-      // 1️⃣ استرجاع الكميات القديمة
-      for (const oldP of sellData.products || []) {
-        if (!oldP?.warehouse || !oldP?.code || !oldP?.qty) continue;
+    // 1️⃣ استرجاع الكميات القديمة
+    for (const oldP of sellData.products || []) {
+      if (!oldP?.warehouse || !oldP?.code || !oldP?.qty) continue;
 
-        const qtyPath = `products/${oldP.warehouse}/${oldP.id}/quantity`;
-        const qtyRef = ref(database, qtyPath);
-        const qtySnap = await get(qtyRef);
+      const qtyPath = `products/${oldP.warehouse}/${oldP.id}/quantity`;
+      const qtyRef = ref(database, qtyPath);
+      const qtySnap = await get(qtyRef);
 
-        if (!qtySnap.exists()) {
-          return reply(400, {
-            message: `المنتج غير موجود في المخزون: ${oldP.code}`,
-          });
-        }
-
-        const currentQty = Number(qtySnap.val());
-        const restoredQty = currentQty + Number(oldP.qty);
-
-        await set(qtyRef, restoredQty);
-      }
-
-      // 2️⃣ خصم الكميات الجديدة
-      for (const newP of updateData.products) {
-        if (!newP?.warehouse || !newP?.code || !Number.isFinite(Number(newP?.qty)) || Number(newP.qty) <= 0) {
-          return reply(400, {
-            message: "بيانات منتج غير صالحة",
-          });
-        }
-
-        const qtyPath = `products/${newP.warehouse}/${newP.id}/quantity`;
-        const qtyRef = ref(database, qtyPath);
-        const qtySnap = await get(qtyRef);
-        
-        if (!qtySnap.exists()) {
-          return reply(400, {
-            message: `المنتج غير موجود في المخزون: ${newP.code}`,
-          });
-        }
-
-        const currentQty = Number(qtySnap.val());
-        const newQty = currentQty - Number(newP.qty);
-
-        if (newQty < 0) {
-          return reply(400, {
-            message: `❌ الكمية غير كافية للمنتج ${newP.code}`,
-          });
-        }
-
-        await set(qtyRef, newQty);
-      }
-
-      // =========================
-      // 🔢 تحديث الفاتورة
-      // =========================
-
-      sellData.products = updateData.products;
-
-      const newTotalPrice = sellData.products.reduce(
-        (sum: number, p: any) =>
-          sum + Number(p.sellPrice || 0) * Number(p.qty || 0),
-        0
-      );
-
-      sellData.totalPrice = newTotalPrice;
-      sellData.updatedAt = new Date().toISOString();
-
-      // =========================
-      // 💰 تحديث رصيد العميل
-      // =========================
-
-      const customerRef = ref(database, `customer/${sellData.customerId}`);
-      const customerSnap = await get(customerRef);
-
-      if (!customerSnap.exists()) {
-        return reply(400, {
-          message: "العميل غير موجود",
+      if (!qtySnap.exists()) {
+        return res.status(400).json({
+          message: `المنتج غير موجود في المخزون: ${oldP.code}`,
         });
       }
 
-      const customer = customerSnap.val();
-      const currentBalance = Number(customer.balance || 0);
-      console.log(currentBalance, oldTotalPrice, newTotalPrice);
-      const newBalance = currentBalance + (oldTotalPrice - newTotalPrice);
+      const currentQty = Number(qtySnap.val());
+      const restoredQty = roundNumber(decimal(currentQty).plus(oldP.qty));
 
-      await update(customerRef, {
-        balance: newBalance,
+      await set(qtyRef, restoredQty);
+    }
+
+    // 2️⃣ خصم الكميات الجديدة
+    for (const newP of updateData.products) {
+      if (!newP?.warehouse || !newP?.code || !newP?.qty) {
+        return res.status(400).json({
+          message: "بيانات منتج غير صالحة",
+        });
+      }
+
+      const qtyPath = `products/${newP.warehouse}/${newP.id}/quantity`;
+      const qtyRef = ref(database, qtyPath);
+      const qtySnap = await get(qtyRef);
+        
+      if (!qtySnap.exists()) {
+        return res.status(400).json({
+          message: `المنتج غير موجود في المخزون: ${newP.code}`,
+        });
+      }
+
+      const currentQty = Number(qtySnap.val());
+      const newQty = roundNumber(decimal(currentQty).minus(newP.qty));
+
+      if (newQty < 0) {
+        return res.status(400).json({
+          message: `❌ الكمية غير كافية للمنتج ${newP.code}`,
+        });
+      }
+
+      await set(qtyRef, newQty);
+    }
+
+    // =========================
+    // 🔢 تحديث الفاتورة
+    // =========================
+
+    sellData.products = updateData.products;
+
+    const newTotalPrice = roundNumber(sellData.products.reduce(
+      (sum: ReturnType<typeof decimal>, p: any) =>
+        sum.plus(decimal(p.sellPrice || 0).times(p.qty || 0)),
+      decimal(0)
+    ).minus(sellData.discount || 0));
+
+    const paidAmount = decimal(oldTotalPrice).minus(sellData.remainingDebt || 0);
+    sellData.remainingDebt = roundNumber(decimal(newTotalPrice).minus(paidAmount));
+    sellData.totalPrice = newTotalPrice;
+    sellData.updatedAt = new Date().toISOString();
+
+    // =========================
+    // 💰 تحديث رصيد العميل
+    // =========================
+
+    const customerRef = ref(database, `customer/${sellData.customerId}`);
+    const customerSnap = await get(customerRef);
+
+    if (!customerSnap.exists()) {
+      return res.status(400).json({
+        message: "العميل غير موجود",
       });
+    }
 
-      // =========================
-      // 🧾 تسجيل حركة مالية
-      // =========================
+    const customer = customerSnap.val();
+    const currentBalance = Number(customer.balance || 0);
+    console.log(currentBalance, oldTotalPrice, newTotalPrice);
+    const newBalance = roundNumber(decimal(currentBalance).plus(oldTotalPrice).minus(newTotalPrice));
 
-      const paymentId = uuidv4();
-
-      const payment: Payment = {
-        id: paymentId,
-        type: "sell_edit",
-        source: "generated",
-        executer: res.locals.executer,
-        balanceApplied: false,
-        customerId: sellData.customerId,
-        currency: sellData.currency || "",
-        exchangeRate: 1,
-        amount_base: newTotalPrice,
-        amount: newTotalPrice,
-        note: `تعديل على فاتورة بيع - ${id}`,
-        date: new Date().toISOString(),
-      };
-
-      await set(ref(database, `payment/${paymentId}`), payment);
-
-      // =========================
-      // 💾 حفظ الفاتورة
-      // =========================
-
-      await update(sellRef, sellData);
-
-      return reply(200, {
-        message: "✅ تم تحديث الفاتورة بنجاح",
-        sell: sellData,
-      });
+    await update(customerRef, {
+      balance: newBalance,
     });
-    return res.status(result.status).json(result.body);
+
+    // =========================
+    // 🧾 تسجيل حركة مالية
+    // =========================
+
+    const paymentId = uuidv4();
+
+    const payment: Payment = {
+      id: paymentId,
+      type: "sell_edit",
+      source: "generated",
+      balanceApplied: false,
+      customerId: sellData.customerId,
+      currency: sellData.currency || "",
+      exchangeRate: 1,
+      amount_base: newTotalPrice,
+      amount: newTotalPrice,
+      note: `تعديل على فاتورة بيع - ${id}`,
+      date: new Date().toISOString(),
+    };
+
+    await set(ref(database, `payment/${paymentId}`), payment);
+
+    // =========================
+    // 💾 حفظ الفاتورة
+    // =========================
+
+    await update(sellRef, sellData);
+
+    return res.json({
+      message: "✅ تم تحديث الفاتورة بنجاح",
+      sell: sellData,
+    });
   } catch (error: any) {
-    if (error instanceof RejectedWrite) return res.status(error.status).json(error.body);
     console.error("❌ خطأ أثناء تحديث فاتورة البيع:", error);
 
     return res.status(500).json({
@@ -275,68 +293,63 @@ export const updateSellById = async (req: Request, res: Response) => {
 // 🗑️ حذف فاتورة بيع بالكامل مع إرجاع المخزون وتعديل الرصيد
 export const deleteSellById = async (req: Request, res: Response) => {
   try {
-    const result = await atomic(database, async () => {
-      const { id } = req.params;
-      const sellRef = ref(database, `sells/${id}`);
-      const snapshot = await get(sellRef);
+    const { id } = req.params;
+    const sellRef = ref(database, `sells/${id}`);
+    const snapshot = await get(sellRef);
 
-      if (!snapshot.exists()) {
-        return reply(404, { message: "❌ فاتورة البيع غير موجودة" });
+    if (!snapshot.exists()) {
+      return res.status(404).json({ message: "❌ فاتورة البيع غير موجودة" });
+    }
+
+    const sellData = snapshot.val();
+
+    // 🧩 استرجاع الكميات في المخزون
+    const productsSnap = await get(ref(database, "products"));
+    const products = productsSnap.exists() ? productsSnap.val() : {};
+
+    for (const p of sellData.products) {
+      const warehouse = p.warehouse;
+      const code = p.id || p.code;
+      if (products[warehouse] && products[warehouse][code]) {
+        products[warehouse][code].quantity = roundNumber(decimal(products[warehouse][code].quantity).plus(p.qty));
       }
+    }
 
-      const sellData = snapshot.val();
+    await update(ref(database, "products"), products);
 
-      // 🧩 استرجاع الكميات في المخزون
-      const productsSnap = await get(ref(database, "products"));
-      const products = productsSnap.exists() ? productsSnap.val() : {};
+    // 💰 تعديل رصيد الزبون
+    const customerRef = ref(database, `customer/${sellData.customerId}`);
+    const customerSnap = await get(customerRef);
+    if (customerSnap.exists()) {
+      const customer = customerSnap.val();
+      customer.balance = roundNumber(decimal(customer.balance || 0).plus(sellData.remainingDebt || 0));
+      await update(customerRef, customer);
+    }
 
-      for (const p of sellData.products) {
-        const warehouse = p.warehouse;
-        const code = p.id;
-        if (products[warehouse] && products[warehouse][code]) {
-          products[warehouse][code].quantity += parseFloat(p.qty);
-        }
-      }
+    // 🧾 تسجيل العملية كدفعة حذف
+    const paymentId = uuidv4();
+    const payment: Payment = {
+      type: "sell_delete",
+      source: "generated",
+      balanceApplied: false,
+      customerId: sellData.customerId,
+      currency: sellData.currency || "",
+      exchangeRate: 1,
+      amount_base: 0,
+      amount: 0,
+      note: `حذف فاتورة بيع - ${sellData.id}`,
+      id: paymentId,
+      date: new Date().toLocaleString(),
+    };
+    await set(ref(database, `payment/${paymentId}`), payment);
 
-      await update(ref(database, "products"), products);
+    // حذف الفاتورة
+    await remove(sellRef);
 
-      // 💰 تعديل رصيد الزبون
-      const customerRef = ref(database, `customer/${sellData.customerId}`);
-      const customerSnap = await get(customerRef);
-      if (customerSnap.exists()) {
-        const customer = customerSnap.val();
-        customer.balance = (customer.balance || 0) + sellData.totalPrice;
-        await update(customerRef, customer);
-      }
-
-      // 🧾 تسجيل العملية كدفعة حذف
-      const paymentId = uuidv4();
-      const payment: Payment = {
-        type: "sell_delete",
-        source: "generated",
-        executer: res.locals.executer,
-        balanceApplied: false,
-        customerId: sellData.customerId,
-        currency: sellData.currency || "",
-        exchangeRate: 1,
-        amount_base: 0,
-        amount: 0,
-        note: `حذف فاتورة بيع - ${sellData.id}`,
-        id: paymentId,
-        date: new Date().toLocaleString(),
-      };
-      await set(ref(database, `payment/${paymentId}`), payment);
-
-      // حذف الفاتورة
-      await remove(sellRef);
-
-      return reply(200, {
-        message: `✅ تم حذف الفاتورة ${id} وإرجاع المخزون وتحديث رصيد الزبون.`,
-      });
+    res.json({
+      message: `✅ تم حذف الفاتورة ${id} وإرجاع المخزون وتحديث رصيد الزبون.`,
     });
-    return res.status(result.status).json(result.body);
   } catch (error) {
-    if (error instanceof RejectedWrite) return res.status(error.status).json(error.body);
     console.error("❌ خطأ أثناء حذف فاتورة البيع:", error);
     res.status(500).json({ message: "حدث خطأ أثناء حذف فاتورة البيع" });
   }
@@ -346,12 +359,14 @@ export const returnProductsFromSellInternal = async (
   sellId: string,
   returnedProducts: { code: string; warehouse: string; qty: number }[]
 ): Promise<{ updatedSell: sell; totalRefund: number } | null> => {
+  returnedProducts = normalizeNumbers(returnedProducts);
   const sellRef = ref(database, `sells/${sellId}`);
   const sellSnap = await get(sellRef);
   if (!sellSnap.exists()) return null;
 
   const sellData: sell = sellSnap.val();
-  let totalRefund = 0;
+  const originalTotal = sellData.totalPrice;
+  let totalRefund = decimal(0);
 
   for (const { code, warehouse, qty } of returnedProducts) {
     const product = sellData.products.find(
@@ -360,19 +375,16 @@ export const returnProductsFromSellInternal = async (
     if (!product) continue;
 
     const returnedQty = Math.min(product.qty, qty);
-    product.qty -= returnedQty;
-    totalRefund += returnedQty * Number(product.sellPrice);
+    product.qty = roundNumber(decimal(product.qty).minus(returnedQty));
+    totalRefund = totalRefund.plus(decimal(returnedQty).times(product.sellPrice));
   }
 
   sellData.products = sellData.products.filter((p) => p.qty > 0);
-  sellData.totalPrice = sellData.products.reduce(
-    (sum, p) => sum + Number(p.sellPrice) * Number(p.qty),
-    0
-  );
+  sellData.totalPrice = roundNumber(decimal(originalTotal).minus(totalRefund));
 
   await update(sellRef, sellData);
 
-  return { updatedSell: sellData, totalRefund };
+  return { updatedSell: sellData, totalRefund: roundNumber(totalRefund) };
 };
 
 
@@ -436,8 +448,10 @@ export const addAfterSellDiscountInternal = async ({sellId, discount}: {sellId: 
     }
 
     const sellData: sell = sellSnap.val();
+    discount = roundNumber(discount);
     sellData.discount = discount;
-    sellData.totalPrice = (sellData.totalPrice || 0) - discount;
+    sellData.totalPrice = roundNumber(decimal(sellData.totalPrice || 0).minus(discount));
+    sellData.remainingDebt = roundNumber(decimal(sellData.remainingDebt || 0).minus(discount));
 
     await update(sellRef, sellData);
 

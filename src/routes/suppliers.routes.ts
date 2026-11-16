@@ -1,13 +1,14 @@
-import { requirePermission } from "../controllers/auth.controller";
 
 import express from 'express';
-import { getAll, create, getSupplierById, updateSupplierInfo } from '../controllers/suppliers.controller';
+import { getAll, getSupplierPage, getSupplierSummary, create, getSupplierById, updateSupplierInfo } from '../controllers/suppliers.controller';
 const router = express.Router();
 
 router.get('/', getAll);
-router.post('/', requirePermission("suppliers"), create);
+router.get('/page', getSupplierPage);
+router.get('/summary', getSupplierSummary);
+router.post('/', create);
 
-router.put("/:id", requirePermission("suppliers"), updateSupplierInfo);
+router.put("/:id", updateSupplierInfo);
 
 router.post('/byId', getSupplierById);
 

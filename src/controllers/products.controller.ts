@@ -1,11 +1,24 @@
-import { reply, RejectedWrite } from "../utils/reply";
+import { decimal, roundNumber, normalizeNumbers } from "../utils/numbers";
+import { set, push } from "../utils/database";
 import { Request, Response } from "express";
 import { Product } from "../types/product";
-import { atomic, ref, get, set, push, remove } from "../database";
+import { ref, get, remove } from "firebase/database";
 import { database } from "../firebaseConfig";
+
+let productsCache: any = null;
+let lastFetch = 0;
+let compareTime = 45_000
+
+const fetchReset = () => {
+  lastFetch = Date.now() - compareTime;
+}
 
 export const getAll = async (_req: Request, res: Response) => {
   try {
+    if (productsCache && Date.now() - lastFetch < compareTime) {
+      return res.json(productsCache);
+    }
+
     const snapshot = await get(ref(database, "products"));
 
     const products = snapshot.exists()
@@ -19,6 +32,8 @@ export const getAll = async (_req: Request, res: Response) => {
       : [];
 
     // تحديث الكاش
+    productsCache = products;
+    lastFetch = Date.now();
 
     res.json(products);
   } catch (error) {
@@ -138,7 +153,7 @@ export const getProductById = async (req: Request, res: Response) => {
 
 export const create = async (req: Request, res: Response) => {
   try {
-    const newProduct: Product = req.body;
+    const newProduct: Product = normalizeNumbers(req.body);
 
     if (!newProduct.warehouse)
       return res.status(400).json({ message: "warehouse is required" });
@@ -156,6 +171,7 @@ export const create = async (req: Request, res: Response) => {
 
     await set(newRef, productData);
 
+    fetchReset();
 
     res.json({
       message: "تم إنشاء المنتج بنجاح",
@@ -173,10 +189,11 @@ export const updateQuantityOnSell = async (
   warehouse: string,
   soldQuantity: number,
 ): Promise<Product | null> => {
+  soldQuantity = roundNumber(soldQuantity);
   const productRef = ref(database, `products/${warehouse}/${productId}`);
+  console.log(soldQuantity);
   const snapshot = await get(productRef);
-  if (!snapshot.exists()) throw new Error("Product not found in warehouse");
-  if (!Number.isFinite(soldQuantity) || soldQuantity <= 0) throw new Error("Invalid quantity");
+  if (!snapshot.exists()) return null;
 
   const existingProduct: Product = snapshot.val();
   if (existingProduct.quantity < soldQuantity) {
@@ -187,11 +204,14 @@ export const updateQuantityOnSell = async (
       `❌ الكمية غير كافية. المتاح: ${existingProduct.quantity}, المطلوب: ${soldQuantity}`,
     );
   }
+  console.log(existingProduct);
 
+  fetchReset();
 
-  const newQuantity = existingProduct.quantity - soldQuantity;
+  const newQuantity = roundNumber(decimal(existingProduct.quantity).minus(soldQuantity));
   existingProduct.quantity = newQuantity;
   existingProduct.updatedDate = new Date().toLocaleString();
+  console.log(existingProduct);
   await set(productRef, existingProduct);
 
   return existingProduct;
@@ -199,41 +219,38 @@ export const updateQuantityOnSell = async (
 
 export const updateProduct = async (req: Request, res: Response) => {
   try {
-    const result = await atomic(database, async () => {
-      const { id } = req.params;
-      const updatedFields = req.body;
+    const { id } = req.params;
+    const updatedFields = req.body;
 
-      const snapshot = await get(ref(database, "products"));
-      if (!snapshot.exists())
-        return reply(404, { message: "المنتج غير موجود" });
+    const snapshot = await get(ref(database, "products"));
+    if (!snapshot.exists())
+      return res.status(404).json({ message: "المنتج غير موجود" });
 
-      const warehouses = snapshot.val();
+    const warehouses = snapshot.val();
 
+    fetchReset();
 
-      for (const warehouse in warehouses) {
-        for (const productId in warehouses[warehouse]) {
-          if (productId === id) {
-            const newData = {
-              ...warehouses[warehouse][productId],
-              ...updatedFields,
-              updatedDate: new Date().toLocaleString(),
-            };
+    for (const warehouse in warehouses) {
+      for (const productId in warehouses[warehouse]) {
+        if (productId === id) {
+          const newData = {
+            ...warehouses[warehouse][productId],
+            ...updatedFields,
+            updatedDate: new Date().toLocaleString(),
+          };
 
-            await set(
-              ref(database, `products/${warehouse}/${productId}`),
-              newData,
-            );
+          await set(
+            ref(database, `products/${warehouse}/${productId}`),
+            newData,
+          );
 
-            return reply(200, { message: "تم تحديث المنتج", data: newData });
-          }
+          return res.json({ message: "تم تحديث المنتج", data: newData });
         }
       }
+    }
 
-      return reply(404, { message: "المنتج غير موجود" });
-    });
-    return res.status(result.status).json(result.body);
+    res.status(404).json({ message: "المنتج غير موجود" });
   } catch (error) {
-    if (error instanceof RejectedWrite) return res.status(error.status).json(error.body);
     console.error("❌ خطأ أثناء تحديث المنتج:", error);
     res.status(500).json({ message: "حدث خطأ أثناء تحديث المنتج" });
   }
@@ -241,30 +258,27 @@ export const updateProduct = async (req: Request, res: Response) => {
 
 export const deleteProduct = async (req: Request, res: Response) => {
   try {
-    const result = await atomic(database, async () => {
-      const { id } = req.params;
+    const { id } = req.params;
 
-      const snapshot = await get(ref(database, "products"));
-      if (!snapshot.exists())
-        return reply(404, { message: "المنتج غير موجود" });
+    const snapshot = await get(ref(database, "products"));
+    if (!snapshot.exists())
+      return res.status(404).json({ message: "المنتج غير موجود" });
 
-      const warehouses = snapshot.val();
+    const warehouses = snapshot.val();
 
-      for (const warehouse in warehouses) {
-        for (const productId in warehouses[warehouse]) {
-          if (productId === id) {
-            await remove(ref(database, `products/${warehouse}/${productId}`));
-            return reply(200, { message: "تم حذف المنتج" });
-          }
+    for (const warehouse in warehouses) {
+      for (const productId in warehouses[warehouse]) {
+        if (productId === id) {
+          await remove(ref(database, `products/${warehouse}/${productId}`));
+          return res.json({ message: "تم حذف المنتج" });
         }
       }
+    }
 
+    fetchReset();
 
-      return reply(404, { message: "المنتج غير موجود" });
-    });
-    return res.status(result.status).json(result.body);
+    res.status(404).json({ message: "المنتج غير موجود" });
   } catch (error) {
-    if (error instanceof RejectedWrite) return res.status(error.status).json(error.body);
     console.error("❌ خطأ أثناء حذف المنتج:", error);
     res.status(500).json({ message: "حدث خطأ أثناء حذف المنتج" });
   }
@@ -273,6 +287,7 @@ export const deleteProduct = async (req: Request, res: Response) => {
 export const createOrUpdateProductInternal = async (
   newProduct: Product,
 ): Promise<Product> => {
+  newProduct = normalizeNumbers(newProduct);
   const NowDate = new Date().toLocaleString();
 
   const warehousePath = `products/${newProduct.warehouse}`;
@@ -293,7 +308,7 @@ export const createOrUpdateProductInternal = async (
         const updatedProduct: Product = {
           ...existingProduct,
           ...newProduct,
-          quantity: existingProduct.quantity + newProduct.quantity,
+          quantity: roundNumber(decimal(existingProduct.quantity).plus(newProduct.quantity)),
           updatedDate: NowDate,
           id: productId, // مهم جداً: المفتاح من الـ DB
         };
@@ -319,6 +334,7 @@ export const createOrUpdateProductInternal = async (
 
   await set(newRef, productToAdd);
 
+  fetchReset();
 
   return productToAdd;
 };

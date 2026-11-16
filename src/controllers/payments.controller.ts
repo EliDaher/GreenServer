@@ -1,8 +1,8 @@
-import { reply, RejectedWrite } from "../utils/reply";
+import { set } from "../utils/database";
 import { v4 as uuidv4 } from "uuid";
 import { Request, Response } from "express";
 import { Payment } from "../types/payment";
-import { atomic, ref, get, remove, set } from "../database";
+import { ref, get, remove } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { updateCustomerBalanceInternal } from "./customer.controller";
 import { updateSupplierBalanceInternal } from "./suppliers.controller";
@@ -82,23 +82,16 @@ export const getMonthPayments = async (req: Request, res: Response) => {
 export const createPayment = async (req: Request, res: Response) => {
   try {
     const { newPayment }: { newPayment: Payment } = req.body;
-    if (!newPayment || !["income", "expense"].includes(newPayment.type) ||
-        !Number.isFinite(newPayment.amount) || newPayment.amount === 0 ||
-        !Number.isFinite(newPayment.exchangeRate) || newPayment.exchangeRate <= 0 ||
-        !Number.isFinite(newPayment.amount_base)) {
-      return res.status(400).json({ error: "Invalid cashbox payment" });
-    }
 
     const id = uuidv4();
     const now = new Date().toLocaleString();
 
     const payment: Payment = {
       ...newPayment,
-      executer: res.locals.executer,
       id,
       date: newPayment.date || now,
-      source: "cashbox",
-      balanceApplied: false,
+      source: newPayment.source || "cashbox",
+      balanceApplied: newPayment.balanceApplied ?? false,
     };
 
     await set(ref(database, `payment/${id}`), payment);
@@ -131,40 +124,36 @@ export const createPaymentInternal = async (
 
 export const deletePayment = async (req: Request, res: Response) => {
   try {
-    const result = await atomic(database, async () => {
-      const { id } = req.params;
-      const paymentRef = ref(database, `payment/${id}`);
-      const snapshot = await get(paymentRef);
+    const { id } = req.params;
+    const paymentRef = ref(database, `payment/${id}`);
+    const snapshot = await get(paymentRef);
 
-      if (!snapshot.exists()) {
-        return reply(404, { error: "Payment not found" });
+    if (!snapshot.exists()) {
+      return res.status(404).json({ error: "Payment not found" });
+    }
+
+    const payment = snapshot.val() as Payment;
+
+    if (isGeneratedLegacyPayment(payment)) {
+      return res.status(400).json({
+        error:
+          "لا يمكن حذف هذه الدفعة لأنها مرتبطة بفاتورة أو عملية أخرى. عدّل العملية الأصلية بدلاً من ذلك.",
+      });
+    }
+
+    if (shouldReverseBalance(payment)) {
+      if (payment.customerId) {
+        await updateCustomerBalanceInternal(payment.customerId, -Number(payment.amount || 0));
       }
 
-      const payment = snapshot.val() as Payment;
-
-      if (isGeneratedLegacyPayment(payment)) {
-        return reply(400, {
-          error:
-            "لا يمكن حذف هذه الدفعة لأنها مرتبطة بفاتورة أو عملية أخرى. عدّل العملية الأصلية بدلاً من ذلك.",
-        });
+      if (payment.supplierId && payment.supplierId !== "elidaher") {
+        await updateSupplierBalanceInternal(payment.supplierId, -Number(payment.amount || 0));
       }
+    }
 
-      if (shouldReverseBalance(payment)) {
-        if (payment.customerId) {
-          await updateCustomerBalanceInternal(payment.customerId, -Number(payment.amount || 0));
-        }
-
-        if (payment.supplierId && payment.supplierId !== "elidaher") {
-          await updateSupplierBalanceInternal(payment.supplierId, -Number(payment.amount || 0));
-        }
-      }
-
-      await remove(paymentRef);
-      return reply(200, { message: "Payment deleted successfully", data: payment });
-    });
-    return res.status(result.status).json(result.body);
+    await remove(paymentRef);
+    res.json({ message: "Payment deleted successfully", data: payment });
   } catch (error: any) {
-    if (error instanceof RejectedWrite) return res.status(error.status).json(error.body);
     console.error("Error deleting payment:", error);
     res.status(500).json({ error: error.message || "فشل في حذف الدفعة" });
   }

@@ -1,32 +1,16 @@
+import { pageCustomerSummaries, readSupplierSummaries } from "../services/customerSummary.service";
+import { decimal, roundNumber, normalizeNumbers } from "../utils/numbers";
+import { set, update } from "../utils/database";
 import { v4 as uuidv4 } from "uuid";
 import { Supplier } from "../types/supplier";
 import { Request, Response } from "express";
 import { purchase } from "../types/purchase";
 import { Payment } from "../types/payment";
-import { ref, get, set, update, remove } from "../database";
+import { ref, get, remove } from "firebase/database";
 import { database } from "../firebaseConfig";
 import { Customer } from "../types/customer";
 
-const toSafeSingleDecimalAmount = (value: unknown): number => {
-  if (typeof value === "number") {
-    return Number.isFinite(value) ? Math.trunc(value * 10) / 10 : 0;
-  }
-
-  if (typeof value === "string") {
-    const trimmedValue = value.trim();
-    if (!trimmedValue) return 0;
-
-    const amountMatch = trimmedValue.match(/^([+-]?\d+)(?:[.,](\d))?/);
-    if (!amountMatch) return 0;
-
-    const parsedValue = Number(
-      `${amountMatch[1]}${amountMatch[2] ? `.${amountMatch[2]}` : ""}`
-    );
-    return Number.isFinite(parsedValue) ? parsedValue : 0;
-  }
-
-  return 0;
-};
+const toAmount = (value: unknown): number => roundNumber(value == null || value === "" ? 0 : value as number | string);
 
 // ✅ جلب جميع الموردين
 export const getAll = async (_req: Request, res: Response) => {
@@ -41,6 +25,25 @@ export const getAll = async (_req: Request, res: Response) => {
 };
 
 // ✅ إنشاء أو تحديث مورد
+async function sendSupplierSummaries(req: Request, res: Response, paged: boolean) {
+  const started = performance.now();
+  const rows = await readSupplierSummaries();
+  if (!rows) {
+    res.status(503).json({ error: "Supplier summaries are temporarily unavailable" });
+    return;
+  }
+  const ready = performance.now();
+  const result = paged ? pageCustomerSummaries(rows, req.query, "supplier") : rows;
+  if (process.env.SUPPLIER_SUMMARY_TIMING === "1") {
+    res.setHeader("Server-Timing",
+      `cache;dur=${(ready - started).toFixed(2)}, prepare;dur=${(performance.now() - ready).toFixed(2)}`);
+  }
+  res.json(result);
+}
+
+export const getSupplierPage = (req: Request, res: Response) => sendSupplierSummaries(req, res, true);
+export const getSupplierSummary = (req: Request, res: Response) => sendSupplierSummaries(req, res, false);
+
 export const create = async (req: Request, res: Response) => {
   try {
     const now = new Date().toLocaleString();
@@ -95,9 +98,8 @@ export const updateSupplierInfo = async (
   const supplier = snapshot.val() as Supplier;
   const now = new Date().toLocaleString();
 
-  const fields = { updatedDate: now, name: updates.name, number: updates.number };
-  await update(dbRef, fields);
-  const updatedSupplier: Supplier = { ...supplier, ...fields };
+  let updatedSupplier: Supplier = { ...supplier, updatedDate: now, name: updates.name, number: updates.number };
+  await update(dbRef, updatedSupplier);
   res.json({ message: "✅ تم تحديث بيانات المورد", data: updatedSupplier });
   return updatedSupplier;
 };
@@ -109,6 +111,7 @@ export const updateSupplierInternal = async (
   paymentUpdates?: Payment
 ): Promise<Supplier | null> => {
 
+  console.log(id, sellUpdates, paymentUpdates);
 
   const supplierId = typeof id === "string" ? id : (id as any).id;
   if (!supplierId) throw new Error("Invalid supplier id");
@@ -120,11 +123,11 @@ export const updateSupplierInternal = async (
   const now = new Date().toLocaleString();
 
   if (sellUpdates) {
-    const currentBalance = toSafeSingleDecimalAmount(supplier.balance);
-    const remainingDebt = toSafeSingleDecimalAmount(sellUpdates.remainingDebt);
+    const currentBalance = Number(supplier.balance || 0);
+    const remainingDebt = toAmount(sellUpdates.remainingDebt);
     const updatedSupplier: Supplier = {
       ...supplier,
-      balance: currentBalance + remainingDebt,
+      balance: roundNumber(decimal(currentBalance).plus(remainingDebt)),
       purchases: [...(supplier.purchases || []), sellUpdates.id || ""],
       updatedDate: now,
     };
@@ -133,11 +136,11 @@ export const updateSupplierInternal = async (
   }
 
   if (paymentUpdates) {
-    const currentBalance = toSafeSingleDecimalAmount(supplier.balance);
-    const paymentAmount = toSafeSingleDecimalAmount(paymentUpdates.amount);
+    const currentBalance = Number(supplier.balance || 0);
+    const paymentAmount = toAmount(paymentUpdates.amount);
     const updatedSupplier: Supplier = {
       ...supplier,
-      balance: currentBalance + paymentAmount,
+      balance: roundNumber(decimal(currentBalance).plus(paymentAmount)),
       updatedDate: now,
     };
     await set(supplierRef, updatedSupplier);
@@ -157,11 +160,11 @@ export const updateSupplierBalanceInternal = async (
   if (!snapshot.exists()) return null;
 
   const supplier = snapshot.val() as Supplier;
-  const currentBalance = toSafeSingleDecimalAmount(supplier.balance);
-  const safeAmountChange = toSafeSingleDecimalAmount(amountChange);
+  const currentBalance = Number(supplier.balance || 0);
+  const safeAmountChange = toAmount(amountChange);
   const updatedSupplier: Supplier = {
     ...supplier,
-    balance: currentBalance + safeAmountChange,
+    balance: roundNumber(decimal(currentBalance).plus(safeAmountChange)),
     updatedDate: new Date().toLocaleString(),
   };
 
@@ -226,11 +229,14 @@ export const getSupplierById = async (req: Request, res: Response) => {
       transferCost: Number(purchase.transferCost || 0),
     });
 
-    const purchasesSnapshot = await get(ref(database, "purchases"));
+    const [purchasesSnapshot, productsSnapshot, paymentSnapshot] = await Promise.all([
+      get(ref(database, "purchases")),
+      get(ref(database, "products")),
+      get(ref(database, "payment")),
+    ]);
     const purchasesData = purchasesSnapshot.exists()
       ? purchasesSnapshot.val()
       : {};
-    const productsSnapshot = await get(ref(database, "products"));
     const productsData = productsSnapshot.exists() ? productsSnapshot.val() : {};
     const purchasesById = new Map<string, any>();
 
@@ -254,7 +260,6 @@ export const getSupplierById = async (req: Request, res: Response) => {
     const purchases = Array.from(purchasesById.values());
 
     // جلب المدفوعات
-    const paymentSnapshot = await get(ref(database, "payment"));
     const paymentsData = paymentSnapshot.exists()
       ? Object.values(paymentSnapshot.val())
       : [];

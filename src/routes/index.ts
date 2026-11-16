@@ -1,4 +1,3 @@
-import { requirePermission, requireSession } from "../controllers/auth.controller";
 import { Router } from "express";
 import authRoutes from "./auth.routes";
 import productsRouter from "./products.routes";
@@ -16,17 +15,16 @@ import reportsRouter from "./reports.routes";
 const router = Router();
 
 router.use("/auth", authRoutes);
-router.use(requireSession);
 
-router.use("/products", requirePermission("products", "sell_product", "warehouses", "categories"), productsRouter);
-router.use("/suppliers", requirePermission("suppliers", "products", "dashboard", "warehouses", "categories"), suppliersRouter);
-router.use("/purchases", requirePermission("products", "suppliers", "dashboard", "financial_statement"), purchasesRouter);
+router.use("/products", productsRouter);
+router.use("/suppliers", suppliersRouter);
+router.use("/purchases", purchasesRouter);
 router.use("/transactions", transactionsRouter);
-router.use("/payments", requirePermission("financial_statement", "dashboard"), paymentsRouter);
-router.use("/customers", requirePermission("customers", "sell_product", "dashboard"), customersRouter);
-router.use("/sells", requirePermission("sell_product", "dashboard", "warehouses", "financial_statement"), sellsRouter);
-router.use("/warehouses", requirePermission("warehouses", "products", "sell_product", "suppliers", "customers", "categories"), warehousesRouter);
+router.use("/payments", paymentsRouter);
+router.use("/customers", customersRouter);
+router.use("/sells", sellsRouter);
+router.use("/warehouses", warehousesRouter);
 router.use("/users", usersRouter);
-router.use("/reports", requirePermission("financial_statement", "dashboard"), reportsRouter);
+router.use("/reports", reportsRouter);
 
 export default router;

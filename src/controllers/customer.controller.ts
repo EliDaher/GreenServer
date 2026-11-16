@@ -1,9 +1,12 @@
+import { pageCustomerSummaries, readCustomerSummaries } from "../services/customerSummary.service";
+import { decimal, roundNumber } from "../utils/numbers";
+import { set, update } from "../utils/database";
 import { v4 as uuidv4 } from "uuid";
 import { Customer } from "../types/customer";
 import { Request, Response } from "express";
 import { sell } from "../types/sell";
 import { Payment } from "../types/payment";
-import { ref, get, set, update, remove } from "../database";
+import { ref, get, remove, query, orderByChild, equalTo } from "firebase/database";
 import { database } from "../firebaseConfig";
 
 /* =========================================================
@@ -20,6 +23,33 @@ export const getAll = async (_req: Request, res: Response) => {
     res.status(500).json({ error: error.message });
   }
 };
+
+async function sendCustomerSummaries(req: Request, res: Response, paged: boolean) {
+  const started = performance.now();
+  const rows = await readCustomerSummaries();
+  const ready = performance.now();
+  if (!rows) {
+    res.status(503).json({ error: "Customer summaries are temporarily unavailable" });
+    return;
+  }
+  const result = paged ? pageCustomerSummaries(rows, req.query) : rows;
+  if (process.env.CUSTOMER_SUMMARY_TIMING !== "1") {
+    res.json(result);
+    return;
+  }
+
+  const body = JSON.stringify(result);
+  const wait = (ready - started).toFixed(2);
+  const prepare = (performance.now() - ready).toFixed(2);
+  res.setHeader("Server-Timing", `cache;dur=${wait}, prepare;dur=${prepare}`);
+  console.info("[customer-summary]", {
+    waitMs: Number(wait), prepareMs: Number(prepare), bytes: Buffer.byteLength(body),
+  });
+  res.type("json").send(body);
+}
+
+export const getCustomerSummary = (req: Request, res: Response) => sendCustomerSummaries(req, res, false);
+export const getCustomerPage = (req: Request, res: Response) => sendCustomerSummaries(req, res, true);
 
 /* =========================================================
    ✅ 2. إنشاء عميل جديد
@@ -83,9 +113,8 @@ export const updateCustomerInfo = async (
   const customer = snapshot.val() as Customer;
   const now = new Date().toLocaleString();
 
-  const fields = { updatedDate: now, name: updates.name, number: updates.number };
-  await update(dbRef, fields);
-  const updatedCustomer: Customer = { ...customer, ...fields };
+  let updatedCustomer: Customer = { ...customer, updatedDate: now, name: updates.name, number: updates.number };
+  await update(dbRef, updatedCustomer);
   res.json({ message: "✅ تم تحديث بيانات العميل", data: updatedCustomer });
   return updatedCustomer;
 };
@@ -108,14 +137,14 @@ export const updateCustomerInternal = async (
 
   if (sellUpdates) {
     updatedCustomer.balance =
-      (customer.balance || 0) - (sellUpdates.remainingDebt || 0);
+      decimal(customer.balance || 0).minus(sellUpdates.remainingDebt || 0).toNumber();
     updatedCustomer.purchases = [
       ...(customer.purchases || []),
       sellUpdates.id || "",
     ];
   } else if (payUpdates) {
     updatedCustomer.balance =
-      (customer.balance || 0) + (payUpdates.amount || 0);
+      decimal(customer.balance || 0).plus(payUpdates.amount || 0).toNumber();
   }
 
   await update(dbRef, updatedCustomer);
@@ -163,7 +192,10 @@ export const getCustomerById = async (req: Request, res: Response) => {
 
   try {
     // 🔹 جلب العميل فقط
-    const customerSnap = await get(ref(database, `customer/${id}`));
+    const [customerSnap, paymentsSnap] = await Promise.all([
+      get(ref(database, `customer/${id}`)),
+      get(query(ref(database, "payment"), orderByChild("customerId"), equalTo(id))),
+    ]);
     if (!customerSnap.exists())
       return res.status(404).json({ error: "Customer not found" });
 
@@ -180,13 +212,7 @@ export const getCustomerById = async (req: Request, res: Response) => {
     }
 
     // 🔹 جلب مدفوعاته فقط
-    const paymentsRef = ref(database, "payment");
-    const paymentsSnap = await get(paymentsRef);
-    const payments = paymentsSnap.exists()
-      ? Object.values(paymentsSnap.val()).filter(
-          (p: any) => p.customerId === id
-        )
-      : [];
+    const payments = paymentsSnap.exists() ? Object.values(paymentsSnap.val()) : [];
 
     res.json({
       data: {
@@ -215,7 +241,7 @@ export const updateCustomerBalanceInternal = async (
   const customer = snapshot.val() as Customer;
   const updatedCustomer = {
     ...customer,
-    balance: (customer.balance || 0) + amountChange,
+    balance: roundNumber(decimal(customer.balance || 0).plus(roundNumber(amountChange))),
     updatedDate: new Date().toLocaleString(),
   };
 

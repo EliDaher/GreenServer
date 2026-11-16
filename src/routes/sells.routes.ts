@@ -1,4 +1,3 @@
-import { requirePermission } from "../controllers/auth.controller";
 
 import express from 'express';
 import { deleteSellById, getAllSells, getSalesByWarehouseAndDate, getSellById, updateSellById } from '../controllers/sells.controller';
@@ -8,9 +7,9 @@ router.get('/', getAllSells);
 
 router.get("/:id", getSellById);
 
-router.put("/:id", requirePermission("sell_product"), updateSellById);
+router.put("/:id", updateSellById);
 
-router.delete("/:id", requirePermission("sell_product"), deleteSellById);
+router.delete("/:id", deleteSellById);
 
 router.post("/byWarehouseDate", getSalesByWarehouseAndDate);
 

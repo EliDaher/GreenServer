@@ -1,9 +1,7 @@
 import { NextFunction, Request, Response } from "express";
-import { get, ref, remove, set } from "../database";
-import { auth, database } from "../firebaseConfig";
+import { get, ref, remove, set } from "firebase/database";
+import { database } from "../firebaseConfig";
 import { getAllOperations } from "../services/operations.service";
-
-import { accountEmail, validUsername } from "./auth.controller";
 
 const MODULE_PERMISSIONS = [
   "dashboard",
@@ -21,6 +19,7 @@ type ModulePermission = (typeof MODULE_PERMISSIONS)[number];
 
 type UserRecord = {
   username: string;
+  password: string;
   role: "admin" | "staff";
   permissions: ModulePermission[];
   createdAt: string;
@@ -54,11 +53,33 @@ const normalizeRole = (role: unknown): "admin" | "staff" | null => {
   return null;
 };
 
-export const requireAdminUser = (_req: Request, res: Response, next: NextFunction) => {
-  if (res.locals.user?.role !== "admin") {
-    return res.status(403).json({ error: "Forbidden" });
+export const requireAdminUser = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  try {
+    const executer = asString(req.header("x-executer"));
+    if (!executer) {
+      return res.status(401).json({ error: "x-executer header is required" });
+    }
+
+    const snapshot = await get(ref(database, `users/${executer}`));
+    if (!snapshot.exists()) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const user = asRecord(snapshot.val()) as Partial<UserRecord>;
+    if (user.role !== "admin") {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    res.locals.executer = executer;
+    next();
+  } catch (error) {
+    console.error("Admin guard error:", error);
+    return res.status(500).json({ error: "Failed to authorize request" });
   }
-  next();
 };
 
 export const listUsers = async (_req: Request, res: Response) => {
@@ -91,10 +112,10 @@ export const listUsers = async (_req: Request, res: Response) => {
 export const createUser = async (req: Request, res: Response) => {
   try {
     const username = asString(req.body?.username);
-    const password = req.body?.password;
+    const password = asString(req.body?.password);
     const role = normalizeRole(req.body?.role);
 
-    if (!validUsername(username) || typeof password !== "string" || password.length < 6 || !role) {
+    if (!username || !password || !role) {
       return res
         .status(400)
         .json({ error: "username, password and valid role are required" });
@@ -114,19 +135,14 @@ export const createUser = async (req: Request, res: Response) => {
 
     const userToSave: UserRecord = {
       username,
+      password,
       role,
       permissions,
       createdAt: now,
       updatedAt: now,
     };
 
-    await auth.createUser({ uid: username, email: accountEmail(username), password });
-    try {
-      await set(userRef, userToSave);
-    } catch (error) {
-      await auth.deleteUser(username);
-      throw error;
-    }
+    await set(userRef, userToSave);
     return res.status(201).json({
       message: "User created successfully",
       user: {
@@ -146,7 +162,7 @@ export const createUser = async (req: Request, res: Response) => {
 export const updateUser = async (req: Request, res: Response) => {
   try {
     const username = asString(req.params.username);
-    if (!validUsername(username)) {
+    if (!username) {
       return res.status(400).json({ error: "username is required" });
     }
 
@@ -167,9 +183,15 @@ export const updateUser = async (req: Request, res: Response) => {
       role = normalizedRole;
     }
 
-    const password = req.body?.password;
-    if (password != null && (typeof password !== "string" || password.length < 6)) {
-      return res.status(400).json({ error: "Password must contain at least six characters" });
+    const password =
+      req.body?.password != null
+        ? asString(req.body.password)
+        : asString(existing.password);
+
+    if (!password) {
+      return res
+        .status(400)
+        .json({ error: "password cannot be empty when updating user" });
     }
 
     const permissions =
@@ -181,16 +203,13 @@ export const updateUser = async (req: Request, res: Response) => {
 
     const updated: UserRecord = {
       username,
+      password,
       role,
       permissions,
       createdAt: asString(existing.createdAt) || new Date().toLocaleString(),
       updatedAt: new Date().toLocaleString(),
     };
 
-    if (password != null) {
-      await auth.updateUser(username, { password });
-      await auth.revokeRefreshTokens(username);
-    }
     await set(userRef, updated);
 
     return res.json({
@@ -212,7 +231,7 @@ export const updateUser = async (req: Request, res: Response) => {
 export const deleteUser = async (req: Request, res: Response) => {
   try {
     const username = asString(req.params.username);
-    if (!validUsername(username)) {
+    if (!username) {
       return res.status(400).json({ error: "username is required" });
     }
 
@@ -228,7 +247,6 @@ export const deleteUser = async (req: Request, res: Response) => {
     }
 
     await remove(userRef);
-    await auth.deleteUser(username);
     return res.json({ message: "User deleted successfully" });
   } catch (error) {
     console.error("Delete user error:", error);
@@ -253,7 +271,7 @@ export const getOperations = async (req: Request, res: Response) => {
 export const getUserOperations = async (req: Request, res: Response) => {
   try {
     const username = asString(req.params.username);
-    if (!validUsername(username)) {
+    if (!username) {
       return res.status(400).json({ error: "username is required" });
     }
 

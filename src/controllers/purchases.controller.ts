@@ -1,8 +1,9 @@
-import { reply, RejectedWrite } from "../utils/reply";
+import { decimal, roundNumber, normalizeInvoice } from "../utils/numbers";
+import { set, update } from "../utils/database";
 import { Request, Response } from "express";
 import { v4 as uuidv4 } from "uuid";
 import { purchase } from "../types/purchase";
-import { atomic, ref, get, set, update, remove } from "../database";
+import { ref, get, remove } from "firebase/database";
 import { createOrUpdateProductInternal } from "./products.controller";
 import { database } from "../firebaseConfig";
 import { resolveOperationDate } from "../utils/operationDate";
@@ -44,64 +45,60 @@ export const getAllPurchases = async (_req: Request, res: Response) => {
 // ✅ إنشاء عملية شراء جديدة (API)
 export const createPurchase = async (req: Request, res: Response) => {
   try {
-    const result = await atomic(database, async () => {
-      const {
-        supplierId,
-        products,
-        totalPrice,
-        paymentStatus,
-        remainingDebt,
-        code,
-        warehouse,
-        quantity,
-        payPrice,
-        name,
-        currency,
-        exchangeRate,
-        amount_base,
-        transferCost,
-        date,
-      } = req.body;
+    const {
+      supplierId,
+      products,
+      totalPrice,
+      paymentStatus,
+      remainingDebt,
+      code,
+      warehouse,
+      quantity,
+      payPrice,
+      name,
+      currency,
+      exchangeRate,
+      amount_base,
+      transferCost,
+      date,
+    } = req.body;
 
-      const id = uuidv4();
-      const operationDate = resolveOperationDate(date);
-      const normalizedSupplierId = normalizeId(supplierId);
+    const id = uuidv4();
+    const operationDate = resolveOperationDate(date);
+    const normalizedSupplierId = normalizeId(supplierId);
 
-      const purchaseData: purchase = {
-        id,
-        executer: res.locals.executer,
-        supplierId: normalizedSupplierId,
-        code,
-        warehouse,
-        quantity,
-        payPrice,
-        totalPrice,
-        paymentStatus,
-        remainingDebt,
-        date: operationDate,
-        name,
-        currency,
-        exchangeRate,
-        amount_base,
-        transferCost: Number(transferCost || 0),
-      };
+    const purchaseData: purchase = {
+      id,
+      supplierId: normalizedSupplierId,
+      code,
+      warehouse,
+      quantity,
+      payPrice,
+      totalPrice,
+      paymentStatus,
+      remainingDebt,
+      date: operationDate,
+      name,
+      currency,
+      exchangeRate,
+      amount_base,
+      transferCost: Number(transferCost || 0),
+    };
 
-      // ✅ حفظ عملية الشراء في قاعدة البيانات
-      await set(ref(database, `purchases/${id}`), purchaseData);
-      await linkPurchaseToSupplier(normalizedSupplierId, id);
+    // ✅ حفظ عملية الشراء في قاعدة البيانات
+    Object.assign(purchaseData, normalizeInvoice(purchaseData, decimal(roundNumber(purchaseData.quantity)).times(roundNumber(purchaseData.payPrice))));
+  await set(ref(database, `purchases/${id}`), purchaseData);
+    await linkPurchaseToSupplier(normalizedSupplierId, id);
 
-      // ✅ تحديث المخزون لكل منتج تمت إضافته
-      if (Array.isArray(products)) {
-        for (const p of products) {
-          await createOrUpdateProductInternal(p);
-        }
+    // ✅ تحديث المخزون لكل منتج تمت إضافته
+    if (Array.isArray(products)) {
+      for (const p of products) {
+        await createOrUpdateProductInternal(p);
       }
+    }
 
-      return reply(200, { message: "✅ تم تسجيل عملية الشراء", data: purchaseData });
-    });
-    return res.status(result.status).json(result.body);
+    res.json({ message: "✅ تم تسجيل عملية الشراء", data: purchaseData });
   } catch (error: any) {
-    if (error instanceof RejectedWrite) return res.status(error.status).json(error.body);
     console.error("Error creating purchase:", error);
     const statusCode = error?.message === "Invalid operation date" ? 400 : 500;
     res.status(statusCode).json({ error: error.message });
@@ -122,6 +119,7 @@ export const createPurchaseInternal = async (
     date: operationDate,
   };
 
+  Object.assign(purchaseData, normalizeInvoice(purchaseData, decimal(roundNumber(purchaseData.quantity)).times(roundNumber(purchaseData.payPrice))));
   await set(ref(database, `purchases/${id}`), purchaseData);
   return purchaseData;
 };

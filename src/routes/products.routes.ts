@@ -1,14 +1,13 @@
-import { requirePermission } from "../controllers/auth.controller";
 
 import express from 'express';
 import { getAll, create, getProductById, updateProduct, deleteProduct, getByWarehouse } from '../controllers/products.controller';
 const router = express.Router();
 
 router.get('/', getAll);
-router.post('/', requirePermission("products"), create);
+router.post('/', create);
 
-router.put("/:id", requirePermission("products", "warehouses", "categories"), updateProduct);
-router.delete("/:id", requirePermission("products"), deleteProduct);
+router.put("/:id", updateProduct);
+router.delete("/:id", deleteProduct);
 
 router.post("/byId", getProductById);
 

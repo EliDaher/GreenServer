@@ -1,4 +1,3 @@
-import { requirePermission } from "../controllers/auth.controller";
 
 import express from 'express';
 import { createPayment, deletePayment, getAll, getMonthPayments } from '../controllers/payments.controller';
@@ -8,8 +7,8 @@ router.get('/', getAll);
 
 router.get('/month', getMonthPayments);
 
-router.post('/create', requirePermission("financial_statement", "dashboard"), createPayment);
+router.post('/create', createPayment);
 
-router.delete('/:id', requirePermission("financial_statement"), deletePayment);
+router.delete('/:id', deletePayment);
 
 export default router;

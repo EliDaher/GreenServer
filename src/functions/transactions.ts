@@ -1,4 +1,6 @@
-import { get, ref } from "../database";
+import { decimal, roundNumber, normalizeNumbers } from "../utils/numbers";
+import { update } from "../utils/database";
+import { get, ref } from "firebase/database";
 import {
   updateCustomerBalanceInternal,
   updateCustomerInternal,
@@ -7,6 +9,7 @@ import { createPaymentInternal } from "../controllers/payments.controller";
 import {
   createOrUpdateProductInternal,
   getProductById,
+  getProductByIdInternal,
   updateQuantityOnSell,
 } from "../controllers/products.controller";
 import {
@@ -42,6 +45,8 @@ export const handlePurchase = async ({
   newProduct: Product;
   executer?: string;
 }) => {
+  newPurchase = normalizeNumbers(newPurchase);
+  newProduct = normalizeNumbers(newProduct);
   // 1- تسجيل عملية الشراء
   const normalizedExecuter = executer || "Unknown";
   const purchaseWithExecuter: purchase = {
@@ -55,9 +60,7 @@ export const handlePurchase = async ({
   await createOrUpdateProductInternal(newProduct);
 
   // 3- تعديل رصيد المورد (إضافة دين جديد)
-  if (!await updateSupplierInternal(purchaseData.supplierId, purchaseData)) {
-    throw new Error("Supplier not found");
-  }
+  await updateSupplierInternal(purchaseData.supplierId, purchaseData);
 
   // 4- اضافة دفعة في حالة ودجودها
   if (
@@ -69,13 +72,12 @@ export const handlePurchase = async ({
       source: "generated",
       balanceApplied: false,
       supplierId: purchaseData.supplierId,
-      amount: -(purchaseData.totalPrice - purchaseData.remainingDebt),
+      amount: -(roundNumber(decimal(purchaseData.totalPrice).minus(purchaseData.remainingDebt))),
       note: `${newProduct.name} دفعة من ثمن شراء`,
       currency: newPurchase.currency,
       exchangeRate: newPurchase.exchangeRate,
       amount_base: -(
-        newPurchase.exchangeRate *
-        (purchaseData.totalPrice - purchaseData.remainingDebt)
+        decimal(newPurchase.exchangeRate).times(roundNumber(decimal(purchaseData.totalPrice).minus(purchaseData.remainingDebt))).toNumber()
       ),
       date: purchaseData.date,
       executer: normalizedExecuter,
@@ -91,7 +93,7 @@ export const handlePurchase = async ({
       note: `${newProduct.name} دفع كامل ثمن شراء`,
       currency: newPurchase.currency,
       exchangeRate: newPurchase.exchangeRate,
-      amount_base: -(newPurchase.exchangeRate * purchaseData.totalPrice),
+      amount_base: -(decimal(newPurchase.exchangeRate).times(purchaseData.totalPrice).toNumber()),
       date: purchaseData.date,
       executer: normalizedExecuter,
     });
@@ -108,7 +110,7 @@ export const handlePurchase = async ({
       note: `${newProduct.name} transfer/shipping cost`,
       currency: newPurchase.currency,
       exchangeRate: newPurchase.exchangeRate,
-      amount_base: -(newPurchase.exchangeRate * transferCost),
+      amount_base: -(decimal(newPurchase.exchangeRate).times(transferCost).toNumber()),
       date: purchaseData.date,
       executer: normalizedExecuter,
     });
@@ -126,6 +128,7 @@ export const handleSell = async ({
   executer?: string;
 }) => {
   try {
+    newSell = normalizeNumbers(newSell);
     // 1- تسجيل عملية البيع
     const normalizedExecuter = executer || "Unknown";
     const sellWithExecuter: sell = {
@@ -135,14 +138,13 @@ export const handleSell = async ({
     const sellData = await createSellInternal(sellWithExecuter);
 
     // 2- تحديث مخزون المنتجات
-    for (const product of newSell.products) {
-      await updateQuantityOnSell(product.id, product.warehouse, product.qty);
+    console.log(newSell)
+    for (const p of sellData.products) {
+      await updateQuantityOnSell(p.id, p.warehouse, p.qty);
     }
 
     // 3- تعديل رصيد المورد (إضافة دين جديد)
-    if (!await updateCustomerInternal(sellData.customerId, sellData)) {
-      throw new Error("Customer not found");
-    }
+    await updateCustomerInternal(sellData.customerId, sellData);
 
     if (sellData.remainingDebt == 0) {
       await createPaymentInternal({
@@ -154,7 +156,7 @@ export const handleSell = async ({
         note: `دفع كامل ثمن بيع`,
         currency: sellData.currency,
         exchangeRate: sellData.exchangeRate,
-        amount_base: sellData.exchangeRate * sellData.totalPrice,
+        amount_base: decimal(sellData.exchangeRate).times(sellData.totalPrice).toNumber(),
         date: sellData.date,
         executer: normalizedExecuter,
       });
@@ -165,14 +167,13 @@ export const handleSell = async ({
         source: "generated",
         balanceApplied: false,
         customerId: sellData.customerId,
-        amount: sellData.totalPrice - sellData.remainingDebt,
+        amount: roundNumber(decimal(sellData.totalPrice).minus(sellData.remainingDebt)),
         note: `دفعه من ثمن بيع`,
         currency: sellData.currency,
         exchangeRate: sellData.exchangeRate,
         amount_base:
           sellData.partValue ||
-          sellData.exchangeRate *
-            (sellData.totalPrice - sellData.remainingDebt),
+          decimal(sellData.exchangeRate).times(roundNumber(decimal(sellData.totalPrice).minus(sellData.remainingDebt))).toNumber(),
         date: sellData.date,
         executer: normalizedExecuter,
       });
@@ -181,7 +182,7 @@ export const handleSell = async ({
 
     return sellData;
   } catch (err) {
-    throw err;
+    console.log(err);
   }
 };
 
@@ -198,8 +199,8 @@ export const customerPayment = async (
   });
 
   // 2- تحديث رصيد العميل
-  if (!data.customerId || !await updateCustomerInternal(data.customerId, undefined, paymentData)) {
-    throw new Error("Customer not found");
+  if (data.customerId) {
+    await updateCustomerInternal(data.customerId, undefined, data);
   }
 
   return data;
@@ -218,8 +219,8 @@ export const supplierPayment = async (
   });
 
   // 2- تحديث رصيد المورد
-  if (!data.supplierId || !await updateSupplierInternal(data.supplierId, undefined, paymentData)) {
-    throw new Error("Supplier not found");
+  if (data.supplierId) {
+    await updateSupplierInternal(data.supplierId, undefined, data);
   }
 
   return data;
@@ -239,6 +240,7 @@ export const handleSupplierReturn = async (newReturn: {
   executer?: string;
 }) => {
   try {
+    newReturn = normalizeNumbers(newReturn);
     const returnQty = Math.abs(Number(newReturn.qty || 0));
     if (!returnQty) {
       throw new Error("Invalid return quantity");
@@ -249,10 +251,7 @@ export const handleSupplierReturn = async (newReturn: {
       throw new Error("Purchase not found");
     }
 
-    if (purchase.supplierId !== newReturn.supplierId || purchase.code !== newReturn.productCode || purchase.warehouse !== newReturn.warehouse) {
-      throw new Error("Return does not match purchase");
-    }
-    const updatedQuantity = Number(purchase.quantity || 0) - returnQty;
+    const updatedQuantity = roundNumber(decimal(purchase.quantity || 0).minus(returnQty));
     if (updatedQuantity < 0) {
       throw new Error("Return quantity exceeds purchase quantity");
     }
@@ -291,9 +290,9 @@ export const handleSupplierReturn = async (newReturn: {
     if (newReturn.returnType === "debt") {
       balanceChange = -newReturn.returnValue;
     } else if (newReturn.returnType === "part") {
-      balanceChange = -(newReturn.returnValue - newReturn.partValue);
+      balanceChange = -(roundNumber(decimal(newReturn.returnValue).minus(newReturn.partValue)));
     }
-    if (!await updateSupplierBalanceInternal(newReturn.supplierId, balanceChange)) throw new Error("Supplier not found");
+    await updateSupplierBalanceInternal(newReturn.supplierId, balanceChange);
 
     // 4️⃣ تعديل الكمية في الفاتورة
     await updatePurchaseInternal(newReturn.referenceId, {
@@ -306,9 +305,6 @@ export const handleSupplierReturn = async (newReturn: {
     throw error;
   }
 };
-
-const isDatabaseKey = (value: unknown) =>
-  typeof value === "string" && value.trim().length > 0 && !/[.#$\[\]/\u0000-\u001f\u007f]/.test(value);
 
 type CustomerReturnType = "debt" | "cash" | "part";
 
@@ -365,12 +361,12 @@ const normalizeCustomerReturnItems = (
   }
 
   return rawItems.map((item, idx) => {
-    const qty = Number(item.qty);
+    const qty = Math.abs(Number(item.qty || 0));
     const returnValue = Number(item.returnValue || 0);
     const warehouse = item.warehouse?.trim();
     const returnWarehouse = (item.returnWarehouse || item.warehouse)?.trim();
 
-    if (!item.productCode || ![item.productId, warehouse, returnWarehouse].every(isDatabaseKey)) {
+    if (!item.productCode || !item.productId || !warehouse || !returnWarehouse) {
       throw new Error(`Invalid return item at index ${idx}`);
     }
     if (!Number.isFinite(qty) || qty <= 0) {
@@ -392,15 +388,15 @@ const normalizeCustomerReturnItems = (
 };
 
 export const handleCustomerReturn = async (newReturn: CustomerReturnPayload) => {
+  newReturn = normalizeNumbers(newReturn);
   if (!newReturn.customerId || !newReturn.referenceId || !newReturn.returnType) {
     throw new Error("customerId, referenceId, and returnType are required");
   }
 
   const items = normalizeCustomerReturnItems(newReturn);
-  const totalReturnValue = items.reduce(
-    (sum, item) => sum + Number(item.returnValue || 0),
-    0
-  );
+  const totalReturnValue = roundNumber(items.reduce(
+    (sum, item) => sum.plus(item.returnValue || 0), decimal(0)
+  ));
   const partValue = Number(newReturn.partValue || 0);
 
   if (newReturn.returnType === "part") {
@@ -434,7 +430,7 @@ export const handleCustomerReturn = async (newReturn: CustomerReturnPayload) => 
     const key = `${item.productCode}::${item.warehouse}`;
     const current = requestedBySellLine.get(key);
     if (current) {
-      current.qty += item.qty;
+      current.qty = roundNumber(decimal(current.qty).plus(item.qty));
     } else {
       requestedBySellLine.set(key, {
         code: item.productCode,
@@ -467,7 +463,7 @@ export const handleCustomerReturn = async (newReturn: CustomerReturnPayload) => 
     const productSnap = await get(
       ref(database, `products/${item.warehouse}/${item.productId}`)
     );
-    if (!productSnap.exists() || soldLineByKey.get(item.productCode + "::" + item.warehouse)?.id !== item.productId) {
+    if (!productSnap.exists()) {
       throw new Error(
         `Product ${item.productCode} not found in warehouse ${item.warehouse}`
       );
@@ -543,11 +539,14 @@ export const handleCustomerReturn = async (newReturn: CustomerReturnPayload) => 
   if (newReturn.returnType === "debt") {
     balanceChange = totalReturnValue;
   } else if (newReturn.returnType === "part") {
-    balanceChange = totalReturnValue - partValue;
+    balanceChange = roundNumber(decimal(totalReturnValue).minus(partValue));
   }
 
-  if (balanceChange !== 0 && !await updateCustomerBalanceInternal(newReturn.customerId, balanceChange)) {
-    throw new Error("Customer not found");
+  await update(sellRef, {
+    remainingDebt: roundNumber(decimal(sellData.remainingDebt || 0).minus(balanceChange)),
+  });
+  if (balanceChange !== 0) {
+    await updateCustomerBalanceInternal(newReturn.customerId, balanceChange);
   }
 
   return {
@@ -578,12 +577,15 @@ export const warehouseTransfer = async (transferData: {
 
   try{
 
-    const source = await get(ref(database, "products/" + transferData.oldWarehouse + "/" + transferData.productId));
-    if (!source.exists()) throw new Error("Product not found in source warehouse");
-    const product = { product: source.val() };
+    const product = await getProductByIdInternal(transferData.productId);
 
+    if (product?.message) {
+      return product?.message;
+    }
+
+    transferData = normalizeNumbers(transferData);
     const currentStock = Number(product.product.quantity || 0);
-    const stockAfter = currentStock - transferData.quantity;
+    const stockAfter = roundNumber(decimal(currentStock).minus(transferData.quantity));
 
     if (stockAfter < 0) {
       throw new Error("❌ الكمية غير كافية في المستودع");
@@ -647,6 +649,7 @@ export const warehouseTransfer = async (transferData: {
     }
   
   } catch (err) {
-    throw err
+    console.log(err)
+    return (err)
   }
 };
